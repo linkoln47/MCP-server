@@ -2,6 +2,12 @@ import json
 import os
 import re
 
+from code_index import (
+    get_chunk as index_get_chunk,
+    index_project as build_code_index,
+    search_index as index_search,
+)
+
 from pathlib import Path
 from mcp.server.fastmcp import FastMCP
 
@@ -713,6 +719,86 @@ def explain_package(package_path: str) -> str:
         lines.append("")
 
     return "\n".join(lines).strip()
+
+@mcp.tool()
+def index_project(force: bool = False) -> str:
+    """
+    Build or refresh the local SQLite FTS index.
+    Run this once at the beginning of work with the project.
+    """
+    try:
+        stats = build_code_index(PROJECT_ROOT, force=force)
+    except Exception as err:
+        return f"Error: {err}"
+
+    return "\n".join(
+        [
+            "Index updated.",
+            f"files seen: {stats['files_seen']}",
+            f"files indexed: {stats['files_indexed']}",
+            f"files skipped: {stats['files_skipped']}",
+            f"chunks indexed: {stats['chunks_indexed']}",
+        ]
+    )
+
+
+@mcp.tool()
+def search_index(query: str, limit: int = 10) -> str:
+    """
+    Search indexed Go chunks using SQLite FTS5.
+    """
+    try:
+        rows = index_search(query, limit)
+    except Exception as err:
+        return f"Error: {err}"
+
+    if not rows:
+        return f"No indexed chunks found for query: {query}"
+
+    blocks = []
+    for row in rows:
+        blocks.append(
+            "\n".join(
+                [
+                    f"chunk_id: {row['id']}",
+                    f"path: {row['path']}:{row['start_line']}-{row['end_line']}",
+                    f"kind: {row['kind']}",
+                    f"symbol: {row['symbol'] or ''}",
+                    f"package: {row['package_name'] or ''}",
+                    f"score: {row['score']:.6f}",
+                    f"snippet: {row['snippet']}",
+                ]
+            )
+        )
+
+    return "\n\n".join(blocks)
+
+
+@mcp.tool()
+def get_chunk(chunk_id: int) -> str:
+    """
+    Return full indexed chunk content by chunk id.
+    """
+    try:
+        row = index_get_chunk(chunk_id)
+    except Exception as err:
+        return f"Error: {err}"
+
+    if not row:
+        return f"Chunk not found: {chunk_id}"
+
+    return "\n".join(
+        [
+            f"chunk_id: {row['id']}",
+            f"path: {row['path']}:{row['start_line']}-{row['end_line']}",
+            f"kind: {row['kind']}",
+            f"symbol: {row['symbol'] or ''}",
+            f"package: {row['package_name'] or ''}",
+            "",
+            row["content"],
+        ]
+    )
+
 
 if __name__ == "__main__":
     mcp.run()

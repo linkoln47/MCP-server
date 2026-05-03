@@ -225,6 +225,30 @@ def extract_go_consts_vars(text: str) -> tuple[list[str], list[str]]:
 
     return sorted(set(consts)), sorted(set(vars_))
 
+def safe_file_path(path: str) -> Path:
+    clean_path = path.strip().strip("/")
+    target = (PROJECT_ROOT / clean_path).resolve()
+
+    try:
+        target.relative_to(PROJECT_ROOT)
+    except ValueError:
+        raise ValueError("path escapes PROJECT_ROOT")
+
+    if not target.exists():
+        raise ValueError(f"file path does not exist: {path}")
+
+    if not target.is_file():
+        raise ValueError(f"path is not a file: {path}")
+
+    if is_ignored(target):
+        raise ValueError(f"path is ignored: {path}")
+
+    return target
+
+def line_number_for_match(text: str, start: int) -> int:
+    return text.count("\n", 0, start) + 1
+
+##=====Tools=====##
 
 @mcp.tool()
 def repo_map(max_depth: int = 3) -> str:
@@ -450,6 +474,92 @@ def find_entrypoints(limit: int = 50) -> str:
         return "No likely entrypoints found."
 
     return "\n\n".join(results)
+
+@mcp.tool()
+def get_file_outline(path: str) -> str:
+    """
+    Return a compact outline for a single Go source file.
+
+    path must be relative to PROJECT_ROOT, for example:
+    back/internal/domain/auth.go
+    """
+    try:
+        file_path = safe_file_path(path)
+    except ValueError as err:
+        return f"Error: {err}"
+
+    if file_path.suffix != ".go":
+        return f"Unsupported file type: {path}. get_file_outline currently supports Go files only."
+
+    try:
+        text = file_path.read_text(encoding="utf-8")
+    except (UnicodeDecodeError, OSError) as err:
+        return f"Error: cannot read file: {err}"
+
+    package_name = extract_go_package_name(text) or "unknown"
+    imports = extract_go_imports(text)
+
+    types: list[tuple[str, int]] = []
+    functions: list[tuple[str, int]] = []
+
+    for match in re.finditer(
+        r"^\s*type\s+([A-Za-z_][A-Za-z0-9_]*)\b",
+        text,
+        re.MULTILINE,
+    ):
+        name = match.group(1)
+        line = line_number_for_match(text, match.start())
+        types.append((name, line))
+
+    for match in re.finditer(
+        r"^\s*func\s+([A-Za-z_][A-Za-z0-9_]*)\s*\(",
+        text,
+        re.MULTILINE,
+    ):
+        name = match.group(1)
+        line = line_number_for_match(text, match.start())
+        functions.append((name, line))
+
+    method_pattern = (
+        r"^\s*func\s*"
+        r"\(\s*[A-Za-z_][A-Za-z0-9_]*\s+(\*?\s*[A-Za-z_][A-Za-z0-9_]*)\s*\)\s*"
+        r"([A-Za-z_][A-Za-z0-9_]*)\s*\("
+    )
+
+    for match in re.finditer(method_pattern, text, re.MULTILINE):
+        receiver_type = match.group(1).replace(" ", "")
+        method_name = match.group(2)
+        line = line_number_for_match(text, match.start())
+        functions.append((f"({receiver_type}).{method_name}", line))
+
+    lines: list[str] = []
+
+    lines.append(f"file: {file_path.relative_to(PROJECT_ROOT)}")
+    lines.append(f"package {package_name}")
+    lines.append("")
+
+    if imports:
+        lines.append("imports:")
+        for item in imports:
+            lines.append(f"- {item}")
+        lines.append("")
+
+    if types:
+        lines.append("types:")
+        for name, line in sorted(types, key=lambda item: item[1]):
+            lines.append(f"- {name}:{line}")
+        lines.append("")
+
+    if functions:
+        lines.append("functions:")
+        for name, line in sorted(functions, key=lambda item: item[1]):
+            lines.append(f"- {name}:{line}")
+        lines.append("")
+
+    if not imports and not types and not functions:
+        lines.append("No imports, types, or functions detected.")
+
+    return "\n".join(lines).strip()
 
 @mcp.tool()
 def explain_package(package_path: str) -> str:

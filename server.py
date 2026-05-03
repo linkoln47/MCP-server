@@ -5,6 +5,7 @@ import re
 from code_index import (
     get_chunk as index_get_chunk,
     index_project as build_code_index,
+    package_dependency_graph as build_package_dependency_graph,
     search_index as index_search,
 )
 
@@ -66,7 +67,6 @@ def safe_package_dir(package_path: str) -> Path:
 
     return target
 
-
 def find_go_package_dirs(root: Path, limit: int = 10) -> list[Path]:
     package_dirs: list[Path] = []
     seen: set[Path] = set()
@@ -86,13 +86,11 @@ def find_go_package_dirs(root: Path, limit: int = 10) -> list[Path]:
 
     return package_dirs
 
-
 def extract_go_package_name(text: str) -> str | None:
     match = re.search(r"^\s*package\s+([A-Za-z_][A-Za-z0-9_]*)\b", text, re.MULTILINE)
     if not match:
         return None
     return match.group(1)
-
 
 def extract_go_imports(text: str) -> list[str]:
     imports: list[str] = []
@@ -254,6 +252,81 @@ def safe_file_path(path: str) -> Path:
 def line_number_for_match(text: str, start: int) -> int:
     return text.count("\n", 0, start) + 1
 
+def graph_node_label(node: dict) -> str:
+    return str(node.get("label") or node.get("id") or "")
+
+def format_package_dependency_graph_text(graph: dict) -> str:
+    nodes_by_id = {
+        node["id"]: node
+        for node in graph.get("nodes", [])
+    }
+    edges_by_source: dict[str, list[dict]] = {}
+    for edge in graph.get("edges", []):
+        edges_by_source.setdefault(edge["from"], []).append(edge)
+
+    lines = [
+        f"root: {graph.get('root_path', '.')}",
+        f"packages: {graph.get('packages', 0)}",
+        f"nodes: {len(graph.get('nodes', []))}",
+        f"edges: {len(graph.get('edges', []))}",
+    ]
+
+    source_ids = sorted(
+        graph.get("sources", []),
+        key=lambda node_id: graph_node_label(nodes_by_id.get(node_id, {"id": node_id})),
+    )
+    if not source_ids:
+        lines.extend(["", "No Go packages found."])
+        return "\n".join(lines)
+
+    for source_id in source_ids:
+        source_node = nodes_by_id.get(source_id, {"id": source_id})
+        lines.extend(["", graph_node_label(source_node)])
+
+        edges = sorted(
+            edges_by_source.get(source_id, []),
+            key=lambda edge: graph_node_label(nodes_by_id.get(edge["to"], {"id": edge["to"]})),
+        )
+        if not edges:
+            lines.append("  -> (no package imports after filters)")
+            continue
+
+        for edge in edges:
+            target_node = nodes_by_id.get(edge["to"], {"id": edge["to"]})
+            suffix = "" if edge.get("kind") == "local" else f" [{edge.get('kind')}]"
+            lines.append(f"  -> {graph_node_label(target_node)}{suffix}")
+
+    return "\n".join(lines)
+
+def mermaid_escape(value: str) -> str:
+    return value.replace("\\", "\\\\").replace('"', '\\"')
+
+def format_package_dependency_graph_mermaid(graph: dict) -> str:
+    nodes = graph.get("nodes", [])
+    edges = graph.get("edges", [])
+    if not nodes:
+        return 'flowchart LR\n  empty["No Go packages found"]'
+
+    node_names = {
+        node["id"]: f"N{i}"
+        for i, node in enumerate(nodes)
+    }
+
+    lines = ["flowchart LR"]
+    for node in nodes:
+        label = graph_node_label(node)
+        if node.get("kind") != "local":
+            label = f"{label} [{node.get('kind')}]"
+        lines.append(f'  {node_names[node["id"]]}["{mermaid_escape(label)}"]')
+
+    for edge in edges:
+        source = node_names.get(edge["from"])
+        target = node_names.get(edge["to"])
+        if source and target:
+            lines.append(f"  {source} --> {target}")
+
+    return "\n".join(lines)
+
 ##=====Tools=====##
 
 @mcp.tool()
@@ -316,7 +389,7 @@ def search_code(query: str, limit: int = 20) -> str:
     Search text inside source files.
     Use this before reading files directly.
     """
-    exts = {".go", ".js", ".jsx", ".ts", ".tsx", ".md", ".sql", ".yaml", ".yml"}
+    exts = {".go", ".js", ".jsx", ".ts", ".tsx", ".py", ".md", ".sql", ".yaml", ".yml"}
     query_lower = query.lower()
     results: list[str] = []
 
@@ -719,6 +792,44 @@ def explain_package(package_path: str) -> str:
         lines.append("")
 
     return "\n".join(lines).strip()
+
+@mcp.tool()
+def package_dependency_graph(
+    root_path: str = "",
+    include_external: bool = False,
+    include_stdlib: bool = False,
+    output: str = "text",
+) -> str:
+    """
+    Return a Go package dependency graph.
+
+    root_path narrows source packages to a repository directory, for example:
+    back or back/internal/usecase.
+
+    output supports:
+    - text
+    - json
+    - mermaid
+    """
+    try:
+        graph = build_package_dependency_graph(
+            PROJECT_ROOT,
+            root_path=root_path,
+            include_external=include_external,
+            include_stdlib=include_stdlib,
+        )
+    except Exception as err:
+        return f"Error: {err}"
+
+    output = output.strip().lower() or "text"
+    if output == "text":
+        return format_package_dependency_graph_text(graph)
+    if output == "json":
+        return json.dumps(graph, indent=2, ensure_ascii=False)
+    if output == "mermaid":
+        return format_package_dependency_graph_mermaid(graph)
+
+    return "Error: unsupported output. Use one of: text, json, mermaid."
 
 @mcp.tool()
 def index_project(force: bool = False) -> str:

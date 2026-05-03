@@ -35,7 +35,7 @@ def file_hash(path: Path) -> str:
 def now_utc() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
 
-def run_go_chunker(project_root: Path) -> list[dict]:
+def run_go_chunker_output(project_root: Path) -> dict:
     helper_dir = Path(__file__).resolve().parent / "chunker"
     proc = subprocess.run(
         ["go", "run", ".", "-root", str(project_root)],
@@ -48,7 +48,10 @@ def run_go_chunker(project_root: Path) -> list[dict]:
     if proc.returncode != 0:
         raise RuntimeError(proc.stderr.strip() or "gochunker failed")
 
-    data = json.loads(proc.stdout)
+    return json.loads(proc.stdout)
+
+def run_go_chunker(project_root: Path) -> list[dict]:
+    data = run_go_chunker_output(project_root)
     return data.get("files", [])
 
 def upsert_file(conn, rel_path, language, hash_, size) -> int:
@@ -145,6 +148,185 @@ def index_project(
                     stats["files_deleted"] += 1
 
     return stats
+
+def graph_root_rel_path(project_root: Path, root_path: str) -> str:
+    clean_path = root_path.strip().strip("/")
+    if not clean_path or clean_path == ".":
+        return ""
+
+    parts = Path(clean_path).parts
+    if parts and parts[0] == project_root.name:
+        clean_path = str(Path(*parts[1:])) if len(parts) > 1 else ""
+
+    target = (project_root / clean_path).resolve()
+
+    try:
+        target.relative_to(project_root)
+    except ValueError:
+        raise ValueError("root_path escapes project root")
+
+    if not target.exists():
+        raise ValueError(f"root_path does not exist: {root_path}")
+    if not target.is_dir():
+        raise ValueError(f"root_path is not a directory: {root_path}")
+
+    rel = target.relative_to(project_root).as_posix()
+    return "" if rel == "." else rel
+
+def normalize_go_package(item: dict) -> dict:
+    imports: list[dict] = []
+    for raw_import in item.get("imports", []):
+        if isinstance(raw_import, str):
+            import_path = raw_import
+            package_name = ""
+        else:
+            import_path = str(raw_import.get("import_path", ""))
+            package_name = str(raw_import.get("package_name", ""))
+
+        if import_path:
+            imports.append(
+                {
+                    "import_path": import_path,
+                    "package_name": package_name,
+                }
+            )
+
+    imports.sort(key=lambda value: value["import_path"])
+
+    return {
+        "rel_dir": str(item.get("rel_dir", "")),
+        "import_path": str(item.get("import_path", "")),
+        "package_name": str(item.get("package_name", "")),
+        "module_path": str(item.get("module_path", "")),
+        "imports": imports,
+    }
+
+def package_in_graph_root(package: dict, graph_root: str) -> bool:
+    if not graph_root:
+        return True
+
+    rel_dir = package.get("rel_dir", "")
+    return rel_dir == graph_root or rel_dir.startswith(f"{graph_root}/")
+
+def local_package_node_id(package: dict) -> str:
+    return package.get("rel_dir") or package.get("import_path")
+
+def is_stdlib_import(import_path: str) -> bool:
+    first = import_path.split("/", 1)[0]
+    return "." not in first
+
+def package_dependency_graph(
+    project_root: Path,
+    root_path: str = "",
+    include_external: bool = False,
+    include_stdlib: bool = False,
+) -> dict:
+    project_root = project_root.resolve()
+    graph_root = graph_root_rel_path(project_root, root_path)
+    data = run_go_chunker_output(project_root)
+
+    packages = [
+        normalize_go_package(item)
+        for item in data.get("packages", [])
+        if item.get("import_path")
+    ]
+    packages_by_import = {
+        package["import_path"]: package
+        for package in packages
+    }
+    selected_packages = [
+        package
+        for package in packages
+        if package_in_graph_root(package, graph_root)
+    ]
+
+    nodes_by_id: dict[str, dict] = {}
+    edges_by_key: dict[tuple[str, str, str], dict] = {}
+    source_ids: set[str] = set()
+
+    def add_local_node(package: dict) -> str:
+        node_id = local_package_node_id(package)
+        nodes_by_id[node_id] = {
+            "id": node_id,
+            "kind": "local",
+            "label": package.get("rel_dir") or package.get("import_path"),
+            "rel_dir": package.get("rel_dir"),
+            "import_path": package.get("import_path"),
+            "package_name": package.get("package_name"),
+            "module_path": package.get("module_path"),
+        }
+        return node_id
+
+    def add_import_node(import_path: str, package_name: str, kind: str) -> str:
+        node_id = import_path
+        nodes_by_id[node_id] = {
+            "id": node_id,
+            "kind": kind,
+            "label": import_path,
+            "rel_dir": "",
+            "import_path": import_path,
+            "package_name": package_name,
+            "module_path": "",
+        }
+        return node_id
+
+    for package in selected_packages:
+        source_id = add_local_node(package)
+        source_ids.add(source_id)
+
+        for package_import in package["imports"]:
+            import_path = package_import["import_path"]
+            target_package = packages_by_import.get(import_path)
+
+            if target_package is not None:
+                target_id = add_local_node(target_package)
+                edge_kind = "local"
+            elif is_stdlib_import(import_path):
+                if not include_stdlib:
+                    continue
+                target_id = add_import_node(
+                    import_path,
+                    package_import.get("package_name", ""),
+                    "stdlib",
+                )
+                edge_kind = "stdlib"
+            else:
+                if not include_external:
+                    continue
+                target_id = add_import_node(
+                    import_path,
+                    package_import.get("package_name", ""),
+                    "external",
+                )
+                edge_kind = "external"
+
+            edge_key = (source_id, target_id, import_path)
+            edges_by_key[edge_key] = {
+                "from": source_id,
+                "to": target_id,
+                "import_path": import_path,
+                "kind": edge_kind,
+            }
+
+    kind_order = {"local": 0, "external": 1, "stdlib": 2}
+    nodes = sorted(
+        nodes_by_id.values(),
+        key=lambda node: (kind_order.get(node["kind"], 99), node["id"]),
+    )
+    edges = sorted(
+        edges_by_key.values(),
+        key=lambda edge: (edge["from"], edge["to"], edge["import_path"]),
+    )
+
+    return {
+        "root_path": graph_root or ".",
+        "include_external": include_external,
+        "include_stdlib": include_stdlib,
+        "packages": len(selected_packages),
+        "nodes": nodes,
+        "edges": edges,
+        "sources": sorted(source_ids),
+    }
 
 def fts_query(query: str) -> str:
     raw_tokens = re.findall(r"[A-Za-z0-9_]+", query)

@@ -17,7 +17,8 @@ import (
 )
 
 type Output struct {
-	Files []FileInfo `json:"files"`
+	Files    []FileInfo    `json:"files"`
+	Packages []PackageInfo `json:"packages"`
 }
 
 type FileInfo struct {
@@ -35,6 +36,19 @@ type Chunk struct {
 	Content   string `json:"content"`
 }
 
+type PackageInfo struct {
+	RelDir      string          `json:"rel_dir"`
+	ImportPath  string          `json:"import_path"`
+	PackageName string          `json:"package_name"`
+	ModulePath  string          `json:"module_path"`
+	Imports     []PackageImport `json:"imports"`
+}
+
+type PackageImport struct {
+	ImportPath  string `json:"import_path"`
+	PackageName string `json:"package_name"`
+}
+
 func main() {
 	rootFlag := flag.String("root", ".", "repository root")
 	flag.Parse()
@@ -45,17 +59,26 @@ func main() {
 	}
 
 	var files []FileInfo
+	var packageInfos []PackageInfo
 	for _, moduleRoot := range findModules(root) {
-		got, err := loadModule(root, moduleRoot)
+		gotFiles, gotPackages, err := loadModule(root, moduleRoot)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "gochunker: %s: %v\n", moduleRoot, err)
 			continue
 		}
-		files = append(files, got...)
+		files = append(files, gotFiles...)
+		packageInfos = append(packageInfos, gotPackages...)
 	}
 
 	sort.Slice(files, func(i, j int) bool { return files[i].Path < files[j].Path })
-	if err := json.NewEncoder(os.Stdout).Encode(Output{Files: files}); err != nil {
+	sort.Slice(packageInfos, func(i, j int) bool {
+		if packageInfos[i].RelDir == packageInfos[j].RelDir {
+			return packageInfos[i].ImportPath < packageInfos[j].ImportPath
+		}
+		return packageInfos[i].RelDir < packageInfos[j].RelDir
+	})
+
+	if err := json.NewEncoder(os.Stdout).Encode(Output{Files: files, Packages: packageInfos}); err != nil {
 		fatal(err)
 	}
 }
@@ -93,13 +116,15 @@ func ignoredDir(name string) bool {
 	}
 }
 
-func loadModule(repoRoot, moduleRoot string) ([]FileInfo, error) {
+func loadModule(repoRoot, moduleRoot string) ([]FileInfo, []PackageInfo, error) {
 	cfg := &packages.Config{
 		Dir:   moduleRoot,
 		Tests: false,
 		Mode: packages.NeedName |
 			packages.NeedFiles |
 			packages.NeedCompiledGoFiles |
+			packages.NeedImports |
+			packages.NeedModule |
 			packages.NeedSyntax |
 			packages.NeedTypes |
 			packages.NeedTypesInfo,
@@ -107,15 +132,18 @@ func loadModule(repoRoot, moduleRoot string) ([]FileInfo, error) {
 
 	pkgs, err := packages.Load(cfg, "./...")
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 
 	var files []FileInfo
+	var packageInfos []PackageInfo
 
 	for _, pkg := range pkgs {
 		for _, pkgErr := range pkg.Errors {
 			fmt.Fprintf(os.Stderr, "gochunker: package error: %v\n", pkgErr)
 		}
+
+		packageInfos = append(packageInfos, packageInfoFromPackage(repoRoot, pkg))
 
 		for i, file := range pkg.Syntax {
 			if i >= len(pkg.CompiledGoFiles) {
@@ -149,7 +177,62 @@ func loadModule(repoRoot, moduleRoot string) ([]FileInfo, error) {
 		}
 	}
 
-	return files, nil
+	return files, packageInfos, nil
+}
+
+func packageInfoFromPackage(repoRoot string, pkg *packages.Package) PackageInfo {
+	info := PackageInfo{
+		RelDir:      packageRelDir(repoRoot, pkg),
+		ImportPath:  pkg.PkgPath,
+		PackageName: pkg.Name,
+		ModulePath:  packageModulePath(pkg),
+	}
+
+	importPaths := make([]string, 0, len(pkg.Imports))
+	for importPath := range pkg.Imports {
+		importPaths = append(importPaths, importPath)
+	}
+	sort.Strings(importPaths)
+
+	for _, importPath := range importPaths {
+		imported := pkg.Imports[importPath]
+		packageName := ""
+		if imported != nil {
+			packageName = imported.Name
+		}
+
+		info.Imports = append(info.Imports, PackageImport{
+			ImportPath:  importPath,
+			PackageName: packageName,
+		})
+	}
+
+	return info
+}
+
+func packageRelDir(repoRoot string, pkg *packages.Package) string {
+	for _, absPath := range append(pkg.CompiledGoFiles, pkg.GoFiles...) {
+		if absPath == "" {
+			continue
+		}
+
+		rel, err := filepath.Rel(repoRoot, filepath.Dir(absPath))
+		if err == nil && rel != "." {
+			return filepath.ToSlash(rel)
+		}
+		if err == nil {
+			return "."
+		}
+	}
+
+	return ""
+}
+
+func packageModulePath(pkg *packages.Package) string {
+	if pkg.Module == nil {
+		return ""
+	}
+	return pkg.Module.Path
 }
 
 func chunkFromDecl(fset *token.FileSet, info *types.Info, src []byte, decl ast.Decl) (Chunk, bool) {

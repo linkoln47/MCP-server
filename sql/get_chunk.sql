@@ -2,6 +2,7 @@ SELECT
     chunks.id,
     files.path,
     files.language,
+    files.is_test,
     files.hash,
     chunks.kind,
     chunks.symbol,

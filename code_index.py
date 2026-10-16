@@ -8,12 +8,23 @@ from datetime import datetime, timezone
 from functools import lru_cache
 from pathlib import Path
 
-SQL_DIR = Path(__file__).resolve().parent / "sql"
-DB_NAME = ".repo_index.sqlite3"
+SERVER_DIR = Path(__file__).resolve().parent
+SQL_DIR = SERVER_DIR / "sql"
+CHUNKER_DIR = SERVER_DIR / "chunker"
+# Bump when schema.sql changes: the index is a cache, so a stale one is rebuilt, not migrated.
+SCHEMA_VERSION = 2
 
 @lru_cache
 def sql(name: str) -> str:
     return (SQL_DIR / name).read_text(encoding="utf-8")
+
+def db_path_for(project_root: Path) -> Path:
+    """
+    One index per project root, so pointing the server at another repository
+    never mixes the two projects' chunks.
+    """
+    digest = hashlib.sha256(str(project_root.resolve()).encode("utf-8")).hexdigest()[:16]
+    return SERVER_DIR / f".repo_index-{digest}.sqlite3"
 
 def connect(db_path: Path) -> sqlite3.Connection:
     conn = sqlite3.connect(db_path)
@@ -23,6 +34,11 @@ def connect(db_path: Path) -> sqlite3.Connection:
     return conn
 
 def init_db(conn: sqlite3.Connection) -> None:
+    version = conn.execute("PRAGMA user_version").fetchone()[0]
+    if version != SCHEMA_VERSION:
+        conn.executescript(sql("reset_schema.sql"))
+        conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
+
     conn.executescript(sql("schema.sql"))
 
 def file_hash(path: Path) -> str:
@@ -35,11 +51,10 @@ def file_hash(path: Path) -> str:
 def now_utc() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
 
-def run_go_chunker_output(project_root: Path) -> dict:
-    helper_dir = Path(__file__).resolve().parent / "chunker"
+def run_chunker(project_root: Path, *args: str):
     proc = subprocess.run(
-        ["go", "run", ".", "-root", str(project_root)],
-        cwd=helper_dir,
+        ["go", "run", ".", "-root", str(project_root), *args],
+        cwd=CHUNKER_DIR,
         text=True,
         capture_output=True,
         check=False,
@@ -50,14 +65,26 @@ def run_go_chunker_output(project_root: Path) -> dict:
 
     return json.loads(proc.stdout)
 
+def run_go_chunker_output(project_root: Path) -> dict:
+    return run_chunker(project_root, "-mode", "index")
+
 def run_go_chunker(project_root: Path) -> list[dict]:
     data = run_go_chunker_output(project_root)
-    return data.get("files", [])
+    return data.get("files") or []
 
-def upsert_file(conn, rel_path, language, hash_, size) -> int:
+def outline_go_files(project_root: Path, paths: list[Path]) -> list[dict]:
+    """
+    Parse Go files with go/parser and return their top-level declarations.
+    """
+    if not paths:
+        return []
+
+    return run_chunker(project_root.resolve(), "-mode", "outline", *(str(path) for path in paths))
+
+def upsert_file(conn, rel_path, language, is_test, hash_, size) -> int:
     row = conn.execute(
         sql("upsert_file.sql"),
-        (rel_path, language, hash_, size, now_utc()),
+        (rel_path, language, int(is_test), hash_, size, now_utc()),
     ).fetchone()
 
     return int(row["id"])
@@ -68,13 +95,14 @@ def index_project(
     force: bool = False,
 ) -> dict:
     project_root = project_root.resolve()
-    db_path = db_path or (Path(__file__).resolve().parent / DB_NAME)
+    db_path = db_path or db_path_for(project_root)
 
     parsed_files = run_go_chunker(project_root)
     seen_paths: set[str] = set()
 
     stats = {
         "files_seen": 0,
+        "test_files_seen": 0,
         "files_indexed": 0,
         "files_skipped": 0,
         "files_deleted": 0,
@@ -94,6 +122,8 @@ def index_project(
 
                 seen_paths.add(rel_path)
                 stats["files_seen"] += 1
+                if item.get("is_test"):
+                    stats["test_files_seen"] += 1
 
                 hash_ = file_hash(abs_path)
                 size = abs_path.stat().st_size
@@ -111,13 +141,15 @@ def index_project(
                     conn,
                     rel_path,
                     item.get("language", "go"),
+                    item.get("is_test", False),
                     hash_,
                     size,
                 )
 
                 conn.execute(sql("delete_chunks_by_file.sql"), (file_id,))
 
-                chunks = item.get("chunks", [])
+                # The chunker encodes an empty Go slice as null.
+                chunks = item.get("chunks") or []
                 conn.executemany(
                     sql("insert_chunk.sql"),
                     [
@@ -175,7 +207,8 @@ def graph_root_rel_path(project_root: Path, root_path: str) -> str:
 
 def normalize_go_package(item: dict) -> dict:
     imports: list[dict] = []
-    for raw_import in item.get("imports", []):
+    # The chunker encodes an empty Go slice as null.
+    for raw_import in item.get("imports") or []:
         if isinstance(raw_import, str):
             import_path = raw_import
             package_name = ""
@@ -227,7 +260,7 @@ def package_dependency_graph(
 
     packages = [
         normalize_go_package(item)
-        for item in data.get("packages", [])
+        for item in data.get("packages") or []
         if item.get("import_path")
     ]
     packages_by_import = {
@@ -369,21 +402,27 @@ def fts_query(query: str) -> str:
 
     return " ".join(parts)
 
-def search_index(query: str, limit: int = 10, db_path: Path | None = None) -> list[dict]:
-    db_path = db_path or (Path(__file__).resolve().parent / DB_NAME)
+def search_index(
+    project_root: Path,
+    query: str,
+    limit: int = 10,
+    include_tests: bool = False,
+    db_path: Path | None = None,
+) -> list[dict]:
+    db_path = db_path or db_path_for(project_root)
 
     with closing(connect(db_path)) as conn:
         init_db(conn)
 
         rows = conn.execute(
             sql("search_index.sql"),
-            (fts_query(query), limit),
+            (fts_query(query), int(include_tests), limit),
         ).fetchall()
 
         return [dict(row) for row in rows]
 
-def get_chunk(chunk_id: int, db_path: Path | None = None) -> dict | None:
-    db_path = db_path or (Path(__file__).resolve().parent / DB_NAME)
+def get_chunk(project_root: Path, chunk_id: int, db_path: Path | None = None) -> dict | None:
+    db_path = db_path or db_path_for(project_root)
 
     with closing(connect(db_path)) as conn:
         init_db(conn)

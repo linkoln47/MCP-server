@@ -9,8 +9,6 @@ wheels/
 # Virtual environments
 .venv
 
-# Go-generated files
-*.mod
-*.sum
-
+# Local code index (WAL mode also leaves -wal/-shm files)
 *.sqlite3
+*.sqlite3-*

@@ -5,6 +5,7 @@ import re
 from code_index import (
     get_chunk as index_get_chunk,
     index_project as build_code_index,
+    outline_go_files,
     package_dependency_graph as build_package_dependency_graph,
     search_index as index_search,
 )
@@ -29,8 +30,56 @@ IGNORE_DIRS = {
 }
 
 
+REPO_MAP_MAX_LINES = 500
+
+SEARCH_CODE_EXTS = {
+    ".go", ".js", ".jsx", ".ts", ".tsx", ".py", ".md", ".sql", ".yaml", ".yml",
+    ".css", ".scss", ".html", ".json", ".toml", ".sh", ".conf", ".nix", ".mod",
+}
+SEARCH_CODE_NAMES = {"Dockerfile", "Makefile", ".env.example", ".gitignore", ".dockerignore"}
+# Generated or huge files that would only drown real matches.
+SEARCH_CODE_SKIP_NAMES = {"package-lock.json"}
+SEARCH_CODE_MAX_BYTES = 1_000_000
+
+
+def is_secret_file(path: Path) -> bool:
+    """
+    Files that hold credentials and must never be read, whatever the allowlist says.
+    """
+    name = path.name.lower()
+    if name == ".env.example":
+        return False
+    return (
+        name == ".env"
+        or name.startswith(".env.")
+        or path.suffix.lower() in {".env", ".pem", ".key", ".p12", ".pfx"}
+        or "secret" in name
+        or "credential" in name
+    )
+
+def is_searchable_text(path: Path) -> bool:
+    if is_secret_file(path) or path.name in SEARCH_CODE_SKIP_NAMES:
+        return False
+    if path.suffix not in SEARCH_CODE_EXTS and path.name not in SEARCH_CODE_NAMES:
+        return False
+    try:
+        return path.stat().st_size <= SEARCH_CODE_MAX_BYTES
+    except OSError:
+        return False
+
+
 def is_ignored(path: Path) -> bool:
     return any(part in IGNORE_DIRS for part in path.parts)
+
+def format_limited(results: list[str], limit: int) -> str:
+    """
+    Join up to limit results; callers collect one extra item so a cut-off
+    output says so instead of looking complete.
+    """
+    if len(results) <= limit:
+        return "\n".join(results)
+
+    return "\n".join(results[:limit] + [f"... truncated at limit={limit}; raise limit or narrow the query"])
 
 def format_entrypoint(path: Path, kind: str, reason: str) -> str:
     return "\n".join(
@@ -40,6 +89,64 @@ def format_entrypoint(path: Path, kind: str, reason: str) -> str:
             f"reason: {reason}",
         ]
     )
+
+FRONTEND_EXTS = (".tsx", ".ts", ".jsx", ".js")
+
+def is_within_root(path: Path) -> bool:
+    try:
+        path.relative_to(PROJECT_ROOT)
+    except ValueError:
+        return False
+    return True
+
+def find_frontend_entrypoints() -> list[tuple[Path, str]]:
+    """
+    Find frontend main files the way Vite does: from the module scripts in each
+    index.html. Falls back to src/main.* when no index.html names one.
+    """
+    found: dict[Path, str] = {}
+
+    for html in sorted(PROJECT_ROOT.rglob("index.html")):
+        if is_ignored(html) or not html.is_file():
+            continue
+
+        try:
+            text = html.read_text(encoding="utf-8")
+        except (UnicodeDecodeError, OSError):
+            continue
+
+        for tag in re.findall(r"<script\b[^>]*>", text, re.IGNORECASE):
+            if not re.search(r"""\btype\s*=\s*["']module["']""", tag, re.IGNORECASE):
+                continue
+
+            src = re.search(r"""\bsrc\s*=\s*["']([^"']+)["']""", tag, re.IGNORECASE)
+            if not src or "://" in src.group(1):
+                continue
+
+            # Vite resolves "/src/main.jsx" against the directory holding index.html.
+            target = (html.parent / src.group(1).lstrip("/")).resolve()
+            if target.is_file() and is_within_root(target) and not is_ignored(target):
+                reason = f"Frontend entrypoint: module script in {html.relative_to(PROJECT_ROOT)}"
+                found.setdefault(target, reason)
+
+    if not found:
+        for pattern in ("src/main.*", "*/src/main.*"):
+            for path in sorted(PROJECT_ROOT.glob(pattern)):
+                if path.suffix in FRONTEND_EXTS and path.is_file() and not is_ignored(path):
+                    found.setdefault(path, "Frontend entrypoint: src/main.* by convention")
+
+    return list(found.items())
+
+def find_frontend_app_files(main_files: list[Path]) -> list[Path]:
+    apps: list[Path] = []
+
+    for main_file in main_files:
+        for ext in FRONTEND_EXTS:
+            path = main_file.with_name(f"App{ext}")
+            if path.is_file() and path not in apps:
+                apps.append(path)
+
+    return apps
 
 def safe_package_dir(package_path: str) -> Path:
     """
@@ -86,148 +193,12 @@ def find_go_package_dirs(root: Path, limit: int = 10) -> list[Path]:
 
     return package_dirs
 
-def extract_go_package_name(text: str) -> str | None:
-    match = re.search(r"^\s*package\s+([A-Za-z_][A-Za-z0-9_]*)\b", text, re.MULTILINE)
-    if not match:
-        return None
-    return match.group(1)
+GO_TYPE_KINDS = ("struct", "interface", "type")
 
-def extract_go_imports(text: str) -> list[str]:
-    imports: list[str] = []
-
-    # import "fmt"
-    for match in re.finditer(r'^\s*import\s+"([^"]+)"', text, re.MULTILINE):
-        imports.append(match.group(1))
-
-    # import (
-    #   "fmt"
-    #   alias "pkg/path"
-    #   _ "pkg/path"
-    # )
-    block_match = re.search(r"^\s*import\s*\((.*?)\)", text, re.MULTILINE | re.DOTALL)
-    if block_match:
-        block = block_match.group(1)
-
-        for line in block.splitlines():
-            line = line.strip()
-
-            if not line or line.startswith("//"):
-                continue
-
-            match = re.search(r'"([^"]+)"', line)
-            if match:
-                imports.append(match.group(1))
-
-    return sorted(set(imports))
-
-
-def extract_go_types(text: str) -> list[str]:
-    results: list[str] = []
-
-    # type User struct { ... }
-    for match in re.finditer(
-        r"^\s*type\s+([A-Za-z_][A-Za-z0-9_]*)\s+struct\b",
-        text,
-        re.MULTILINE,
-    ):
-        results.append(f"{match.group(1)} struct")
-
-    # type Repository interface { ... }
-    for match in re.finditer(
-        r"^\s*type\s+([A-Za-z_][A-Za-z0-9_]*)\s+interface\b",
-        text,
-        re.MULTILINE,
-    ):
-        results.append(f"{match.group(1)} interface")
-
-    # type UserID int / type Handler = ...
-    for match in re.finditer(
-        r"^\s*type\s+([A-Za-z_][A-Za-z0-9_]*)(?:\s*=)?\s+([A-Za-z_][A-Za-z0-9_./\[\]*]*)",
-        text,
-        re.MULTILINE,
-    ):
-        name = match.group(1)
-        rhs = match.group(2)
-
-        # чтобы не дублировать struct/interface
-        if rhs not in {"struct", "interface"}:
-            item = f"{name} type"
-            if item not in results:
-                results.append(item)
-
-    return sorted(set(results))
-
-
-def extract_go_functions(text: str) -> list[str]:
-    results: list[str] = []
-
-    # func NewService(...)
-    for match in re.finditer(
-        r"^\s*func\s+([A-Za-z_][A-Za-z0-9_]*)\s*\(",
-        text,
-        re.MULTILINE,
-    ):
-        results.append(match.group(1))
-
-    return sorted(set(results))
-
-
-def extract_go_methods(text: str) -> list[str]:
-    results: list[str] = []
-
-    # func (s *Service) Login(...)
-    # func (h Handler) ServeHTTP(...)
-    pattern = (
-        r"^\s*func\s*"
-        r"\(\s*([A-Za-z_][A-Za-z0-9_]*)\s+(\*?\s*[A-Za-z_][A-Za-z0-9_]*)\s*\)\s*"
-        r"([A-Za-z_][A-Za-z0-9_]*)\s*\("
-    )
-
-    for match in re.finditer(pattern, text, re.MULTILINE):
-        receiver_type = match.group(2).replace(" ", "")
-        method_name = match.group(3)
-        results.append(f"({receiver_type}).{method_name}")
-
-    return sorted(set(results))
-
-
-def extract_go_consts_vars(text: str) -> tuple[list[str], list[str]]:
-    consts: list[str] = []
-    vars_: list[str] = []
-
-    for match in re.finditer(
-        r"^\s*const\s+([A-Za-z_][A-Za-z0-9_]*)\b",
-        text,
-        re.MULTILINE,
-    ):
-        consts.append(match.group(1))
-
-    for match in re.finditer(
-        r"^\s*var\s+([A-Za-z_][A-Za-z0-9_]*)\b",
-        text,
-        re.MULTILINE,
-    ):
-        vars_.append(match.group(1))
-
-    # const ( A = ... )
-    const_block = re.search(r"^\s*const\s*\((.*?)\)", text, re.MULTILINE | re.DOTALL)
-    if const_block:
-        for line in const_block.group(1).splitlines():
-            line = line.strip()
-            match = re.match(r"([A-Za-z_][A-Za-z0-9_]*)\b", line)
-            if match:
-                consts.append(match.group(1))
-
-    # var ( A = ... )
-    var_block = re.search(r"^\s*var\s*\((.*?)\)", text, re.MULTILINE | re.DOTALL)
-    if var_block:
-        for line in var_block.group(1).splitlines():
-            line = line.strip()
-            match = re.match(r"([A-Za-z_][A-Za-z0-9_]*)\b", line)
-            if match:
-                vars_.append(match.group(1))
-
-    return sorted(set(consts)), sorted(set(vars_))
+def go_decl_label(decl: dict) -> str:
+    if decl["kind"] == "method":
+        return f"({decl['receiver']}).{decl['name']}"
+    return decl["name"]
 
 def safe_file_path(path: str) -> Path:
     clean_path = path.strip().strip("/")
@@ -248,9 +219,6 @@ def safe_file_path(path: str) -> Path:
         raise ValueError(f"path is ignored: {path}")
 
     return target
-
-def line_number_for_match(text: str, start: int) -> int:
-    return text.count("\n", 0, start) + 1
 
 def graph_node_label(node: dict) -> str:
     return str(node.get("label") or node.get("id") or "")
@@ -356,7 +324,12 @@ def repo_map(max_depth: int = 3) -> str:
         else:
             lines.append(f"{prefix}{rel.name}")
 
-    return "\n".join(lines[:500])
+    if len(lines) > REPO_MAP_MAX_LINES:
+        hidden = len(lines) - REPO_MAP_MAX_LINES
+        lines = lines[:REPO_MAP_MAX_LINES]
+        lines.append(f"... truncated: {hidden} more entries; lower max_depth or use search_files")
+
+    return "\n".join(lines)
 
 @mcp.tool()
 def search_files(query: str, limit: int = 20) -> str:
@@ -375,13 +348,14 @@ def search_files(query: str, limit: int = 20) -> str:
         if query_lower in rel.lower():
             results.append(rel)
 
-        if len(results) >= limit:
+        # One result past the limit tells us the output is truncated.
+        if len(results) > limit:
             break
 
     if not results:
         return f"No files found for query: {query}"
 
-    return "\n".join(results)
+    return format_limited(results, limit)
 
 @mcp.tool()
 def search_code(query: str, limit: int = 20) -> str:
@@ -389,20 +363,16 @@ def search_code(query: str, limit: int = 20) -> str:
     Search text inside source files.
     Use this before reading files directly.
     """
-    exts = {".go", ".js", ".jsx", ".ts", ".tsx", ".py", ".md", ".sql", ".yaml", ".yml"}
     query_lower = query.lower()
     results: list[str] = []
 
     for path in PROJECT_ROOT.rglob("*"):
-        if is_ignored(path) or not path.is_file():
-            continue
-
-        if path.suffix not in exts:
+        if is_ignored(path) or not path.is_file() or not is_searchable_text(path):
             continue
 
         try:
             text = path.read_text(encoding="utf-8")
-        except UnicodeDecodeError:
+        except (UnicodeDecodeError, OSError):
             continue
 
         lines = text.splitlines()
@@ -412,13 +382,14 @@ def search_code(query: str, limit: int = 20) -> str:
                 rel = path.relative_to(PROJECT_ROOT)
                 results.append(f"{rel}:{i}: {line.strip()}")
 
-                if len(results) >= limit:
-                    return "\n".join(results)
+                # One match past the limit tells us the output is truncated.
+                if len(results) > limit:
+                    return format_limited(results, limit)
 
     if not results:
         return f"No code matches found for query: {query}"
 
-    return "\n".join(results)
+    return format_limited(results, limit)
 
 @mcp.tool()
 def find_entrypoints(limit: int = 50) -> str:
@@ -462,47 +433,19 @@ def find_entrypoints(limit: int = 50) -> str:
             return "\n\n".join(results)
 
     # 2. Frontend/Vite/React entrypoints
-    frontend_candidates = [
-        "frontend/src/main.jsx",
-        "frontend/src/main.js",
-        "frontend/src/main.tsx",
-        "frontend/src/main.ts",
-        "src/main.jsx",
-        "src/main.js",
-        "src/main.tsx",
-        "src/main.ts",
-    ]
-
-    for candidate in frontend_candidates:
-        path = PROJECT_ROOT / candidate
-
-        if path.exists() and path.is_file() and not is_ignored(path):
-            rel = path.relative_to(PROJECT_ROOT)
-            reason = "Frontend entrypoint: React/Vite main file"
-            results.append(format_entrypoint(rel, path.suffix.lstrip("."), reason))
+    frontend_entrypoints = find_frontend_entrypoints()
+    for path, reason in frontend_entrypoints:
+        rel = path.relative_to(PROJECT_ROOT)
+        results.append(format_entrypoint(rel, path.suffix.lstrip("."), reason))
 
         if len(results) >= limit:
             return "\n\n".join(results)
 
-    # 3. React App files as secondary hints
-    app_candidates = [
-        "frontend/src/App.jsx",
-        "frontend/src/App.js",
-        "frontend/src/App.tsx",
-        "frontend/src/App.ts",
-        "src/App.jsx",
-        "src/App.js",
-        "src/App.tsx",
-        "src/App.ts",
-    ]
-
-    for candidate in app_candidates:
-        path = PROJECT_ROOT / candidate
-
-        if path.exists() and path.is_file() and not is_ignored(path):
-            rel = path.relative_to(PROJECT_ROOT)
-            reason = "Frontend root component: likely used by main.*"
-            results.append(format_entrypoint(rel, path.suffix.lstrip("."), reason))
+    # 3. React App files next to each main file, as secondary hints
+    for path in find_frontend_app_files([path for path, _ in frontend_entrypoints]):
+        rel = path.relative_to(PROJECT_ROOT)
+        reason = "Frontend root component: likely used by main.*"
+        results.append(format_entrypoint(rel, path.suffix.lstrip("."), reason))
 
         if len(results) >= limit:
             return "\n\n".join(results)
@@ -571,72 +514,42 @@ def get_file_outline(path: str) -> str:
         return f"Unsupported file type: {path}. get_file_outline currently supports Go files only."
 
     try:
-        text = file_path.read_text(encoding="utf-8")
-    except (UnicodeDecodeError, OSError) as err:
-        return f"Error: cannot read file: {err}"
+        outline = outline_go_files(PROJECT_ROOT, [file_path])[0]
+    except Exception as err:
+        return f"Error: {err}"
 
-    package_name = extract_go_package_name(text) or "unknown"
-    imports = extract_go_imports(text)
+    decls = outline["decls"]
+    imports = sorted(set(outline["imports"]))
+    # Declarations arrive in source order, so the line numbers read top to bottom.
+    sections = [
+        ("types", [d for d in decls if d["kind"] in GO_TYPE_KINDS]),
+        ("functions", [d for d in decls if d["kind"] in ("func", "method")]),
+        ("constants", [d for d in decls if d["kind"] == "const"]),
+        ("variables", [d for d in decls if d["kind"] == "var"]),
+    ]
 
-    types: list[tuple[str, int]] = []
-    functions: list[tuple[str, int]] = []
+    lines: list[str] = [
+        f"file: {outline['path']}",
+        f"package {outline['package_name'] or 'unknown'}",
+        "",
+    ]
 
-    for match in re.finditer(
-        r"^\s*type\s+([A-Za-z_][A-Za-z0-9_]*)\b",
-        text,
-        re.MULTILINE,
-    ):
-        name = match.group(1)
-        line = line_number_for_match(text, match.start())
-        types.append((name, line))
-
-    for match in re.finditer(
-        r"^\s*func\s+([A-Za-z_][A-Za-z0-9_]*)\s*\(",
-        text,
-        re.MULTILINE,
-    ):
-        name = match.group(1)
-        line = line_number_for_match(text, match.start())
-        functions.append((name, line))
-
-    method_pattern = (
-        r"^\s*func\s*"
-        r"\(\s*[A-Za-z_][A-Za-z0-9_]*\s+(\*?\s*[A-Za-z_][A-Za-z0-9_]*)\s*\)\s*"
-        r"([A-Za-z_][A-Za-z0-9_]*)\s*\("
-    )
-
-    for match in re.finditer(method_pattern, text, re.MULTILINE):
-        receiver_type = match.group(1).replace(" ", "")
-        method_name = match.group(2)
-        line = line_number_for_match(text, match.start())
-        functions.append((f"({receiver_type}).{method_name}", line))
-
-    lines: list[str] = []
-
-    lines.append(f"file: {file_path.relative_to(PROJECT_ROOT)}")
-    lines.append(f"package {package_name}")
-    lines.append("")
+    if outline.get("error"):
+        lines.extend([f"parse error: {outline['error']}", ""])
 
     if imports:
         lines.append("imports:")
-        for item in imports:
-            lines.append(f"- {item}")
+        lines.extend(f"- {item}" for item in imports)
         lines.append("")
 
-    if types:
-        lines.append("types:")
-        for name, line in sorted(types, key=lambda item: item[1]):
-            lines.append(f"- {name}:{line}")
-        lines.append("")
+    for title, items in sections:
+        if items:
+            lines.append(f"{title}:")
+            lines.extend(f"- {go_decl_label(d)}:{d['line']}" for d in items)
+            lines.append("")
 
-    if functions:
-        lines.append("functions:")
-        for name, line in sorted(functions, key=lambda item: item[1]):
-            lines.append(f"- {name}:{line}")
-        lines.append("")
-
-    if not imports and not types and not functions:
-        lines.append("No imports, types, or functions detected.")
+    if not imports and not decls:
+        lines.append("No imports or declarations detected.")
 
     return "\n".join(lines).strip()
 
@@ -688,6 +601,11 @@ def explain_package(package_path: str) -> str:
 
         return f"No Go files found in package path: {package_path}"
 
+    try:
+        outlines = outline_go_files(PROJECT_ROOT, go_files)
+    except Exception as err:
+        return f"Error: {err}"
+
     package_names: set[str] = set()
     all_imports: set[str] = set()
     file_summaries: list[str] = []
@@ -698,24 +616,18 @@ def explain_package(package_path: str) -> str:
     all_consts: set[str] = set()
     all_vars: set[str] = set()
 
-    for path in go_files:
-        try:
-            text = path.read_text(encoding="utf-8")
-        except (UnicodeDecodeError, OSError) as err:
-            file_summaries.append(f"- {path.name}: unreadable ({err})")
-            continue
+    for path, outline in zip(go_files, outlines):
+        if outline["package_name"]:
+            package_names.add(outline["package_name"])
 
-        package_name = extract_go_package_name(text)
-        if package_name:
-            package_names.add(package_name)
+        decls = outline["decls"]
+        types = sorted({f"{d['name']} {d['kind']}" for d in decls if d["kind"] in GO_TYPE_KINDS})
+        functions = sorted({d["name"] for d in decls if d["kind"] == "func"})
+        methods = sorted({go_decl_label(d) for d in decls if d["kind"] == "method"})
+        consts = sorted({d["name"] for d in decls if d["kind"] == "const"})
+        vars_ = sorted({d["name"] for d in decls if d["kind"] == "var"})
 
-        imports = extract_go_imports(text)
-        types = extract_go_types(text)
-        functions = extract_go_functions(text)
-        methods = extract_go_methods(text)
-        consts, vars_ = extract_go_consts_vars(text)
-
-        all_imports.update(imports)
+        all_imports.update(outline["imports"])
         all_types.update(types)
         all_functions.update(functions)
         all_methods.update(methods)
@@ -730,6 +642,8 @@ def explain_package(package_path: str) -> str:
             parts.append(f"funcs: {', '.join(functions)}")
         if methods:
             parts.append(f"methods: {', '.join(methods)}")
+        if outline.get("error"):
+            parts.append(f"parse error: {outline['error']}")
 
         if not parts:
             parts.append("no top-level symbols detected")
@@ -845,21 +759,23 @@ def index_project(force: bool = False) -> str:
     return "\n".join(
         [
             "Index updated.",
-            f"files seen: {stats['files_seen']}",
+            f"files seen: {stats['files_seen']} ({stats['test_files_seen']} test files)",
             f"files indexed: {stats['files_indexed']}",
             f"files skipped: {stats['files_skipped']}",
+            f"files deleted: {stats['files_deleted']}",
             f"chunks indexed: {stats['chunks_indexed']}",
         ]
     )
 
 
 @mcp.tool()
-def search_index(query: str, limit: int = 10) -> str:
+def search_index(query: str, limit: int = 10, include_tests: bool = False) -> str:
     """
     Search indexed Go chunks using SQLite FTS5.
+    _test.go files are indexed but skipped unless include_tests is true.
     """
     try:
-        rows = index_search(query, limit)
+        rows = index_search(PROJECT_ROOT, query, limit, include_tests)
     except Exception as err:
         return f"Error: {err}"
 
@@ -872,7 +788,7 @@ def search_index(query: str, limit: int = 10) -> str:
             "\n".join(
                 [
                     f"chunk_id: {row['id']}",
-                    f"path: {row['path']}:{row['start_line']}-{row['end_line']}",
+                    f"path: {row['path']}:{row['start_line']}-{row['end_line']}" + (" (test)" if row["is_test"] else ""),
                     f"kind: {row['kind']}",
                     f"symbol: {row['symbol'] or ''}",
                     f"package: {row['package_name'] or ''}",
@@ -891,7 +807,7 @@ def get_chunk(chunk_id: int) -> str:
     Return full indexed chunk content by chunk id.
     """
     try:
-        row = index_get_chunk(chunk_id)
+        row = index_get_chunk(PROJECT_ROOT, chunk_id)
     except Exception as err:
         return f"Error: {err}"
 

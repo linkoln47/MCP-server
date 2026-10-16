@@ -5,6 +5,7 @@ CREATE TABLE IF NOT EXISTS files (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     path TEXT NOT NULL UNIQUE,
     language TEXT NOT NULL,
+    is_test INTEGER NOT NULL DEFAULT 0,
     hash TEXT NOT NULL,
     size_bytes INTEGER NOT NULL,
     updated_at TEXT NOT NULL

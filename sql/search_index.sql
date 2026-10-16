@@ -1,6 +1,7 @@
 SELECT
     chunks.id,
     files.path,
+    files.is_test,
     chunks.kind,
     chunks.symbol,
     chunks.package_name,
@@ -12,5 +13,6 @@ FROM chunks_fts
 JOIN chunks ON chunks_fts.rowid = chunks.id
 JOIN files ON chunks.file_id = files.id
 WHERE chunks_fts MATCH ?
+  AND (? OR files.is_test = 0)
 ORDER BY score
 LIMIT ?;

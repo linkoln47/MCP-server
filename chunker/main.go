@@ -5,6 +5,7 @@ import (
 	"flag"
 	"fmt"
 	"go/ast"
+	"go/parser"
 	"go/token"
 	"go/types"
 	"io/fs"
@@ -25,7 +26,25 @@ type FileInfo struct {
 	Path        string  `json:"path"`
 	Language    string  `json:"language"`
 	PackageName string  `json:"package_name"`
+	IsTest      bool    `json:"is_test"`
 	Chunks      []Chunk `json:"chunks"`
+}
+
+// OutlineFile lists the top-level declarations of one Go file, parsed
+// syntactically so it stays fast and works on code that does not type-check.
+type OutlineFile struct {
+	Path        string        `json:"path"`
+	PackageName string        `json:"package_name"`
+	Imports     []string      `json:"imports"`
+	Decls       []OutlineDecl `json:"decls"`
+	Error       string        `json:"error,omitempty"`
+}
+
+type OutlineDecl struct {
+	Kind     string `json:"kind"`
+	Name     string `json:"name"`
+	Receiver string `json:"receiver,omitempty"`
+	Line     int    `json:"line"`
 }
 
 type Chunk struct {
@@ -51,6 +70,7 @@ type PackageImport struct {
 
 func main() {
 	rootFlag := flag.String("root", ".", "repository root")
+	modeFlag := flag.String("mode", "index", "index: chunks and package graph; outline: declarations of the files given as arguments")
 	flag.Parse()
 
 	root, err := filepath.Abs(*rootFlag)
@@ -58,6 +78,92 @@ func main() {
 		fatal(err)
 	}
 
+	switch *modeFlag {
+	case "index":
+		runIndex(root)
+	case "outline":
+		runOutline(root, flag.Args())
+	default:
+		fatal(fmt.Errorf("unknown -mode %q", *modeFlag))
+	}
+}
+
+func runOutline(root string, paths []string) {
+	fset := token.NewFileSet()
+	outlines := make([]OutlineFile, 0, len(paths))
+
+	for _, path := range paths {
+		outlines = append(outlines, outlineFile(fset, root, path))
+	}
+
+	if err := json.NewEncoder(os.Stdout).Encode(outlines); err != nil {
+		fatal(err)
+	}
+}
+
+func outlineFile(fset *token.FileSet, root, path string) OutlineFile {
+	out := OutlineFile{Path: path, Imports: []string{}, Decls: []OutlineDecl{}}
+	if rel, err := filepath.Rel(root, path); err == nil {
+		out.Path = filepath.ToSlash(rel)
+	}
+
+	// A partial AST is still useful, so keep going after a syntax error.
+	file, err := parser.ParseFile(fset, path, nil, parser.SkipObjectResolution)
+	if err != nil {
+		out.Error = err.Error()
+	}
+	if file == nil {
+		return out
+	}
+
+	out.PackageName = file.Name.Name
+	for _, spec := range file.Imports {
+		out.Imports = append(out.Imports, strings.Trim(spec.Path.Value, "\"`"))
+	}
+
+	line := func(pos token.Pos) int { return fset.Position(pos).Line }
+
+	for _, decl := range file.Decls {
+		switch d := decl.(type) {
+		case *ast.FuncDecl:
+			item := OutlineDecl{Kind: "func", Name: d.Name.Name, Line: line(d.Pos())}
+			if d.Recv != nil && len(d.Recv.List) > 0 {
+				item.Kind = "method"
+				item.Receiver = exprName(d.Recv.List[0].Type)
+			}
+			out.Decls = append(out.Decls, item)
+
+		case *ast.GenDecl:
+			for _, spec := range d.Specs {
+				switch s := spec.(type) {
+				case *ast.TypeSpec:
+					out.Decls = append(out.Decls, OutlineDecl{Kind: typeKind(s), Name: s.Name.Name, Line: line(s.Pos())})
+				case *ast.ValueSpec:
+					for _, name := range s.Names {
+						if name.Name != "_" {
+							out.Decls = append(out.Decls, OutlineDecl{Kind: d.Tok.String(), Name: name.Name, Line: line(name.Pos())})
+						}
+					}
+				}
+			}
+		}
+	}
+
+	return out
+}
+
+func typeKind(spec *ast.TypeSpec) string {
+	switch spec.Type.(type) {
+	case *ast.StructType:
+		return "struct"
+	case *ast.InterfaceType:
+		return "interface"
+	default:
+		return "type"
+	}
+}
+
+func runIndex(root string) {
 	var files []FileInfo
 	var packageInfos []PackageInfo
 	for _, moduleRoot := range findModules(root) {
@@ -119,7 +225,7 @@ func ignoredDir(name string) bool {
 func loadModule(repoRoot, moduleRoot string) ([]FileInfo, []PackageInfo, error) {
 	cfg := &packages.Config{
 		Dir:   moduleRoot,
-		Tests: false,
+		Tests: true,
 		Mode: packages.NeedName |
 			packages.NeedFiles |
 			packages.NeedCompiledGoFiles |
@@ -137,13 +243,18 @@ func loadModule(repoRoot, moduleRoot string) ([]FileInfo, []PackageInfo, error) 
 
 	var files []FileInfo
 	var packageInfos []PackageInfo
+	// With Tests enabled a package's files appear in both its plain and its test variant.
+	seenFiles := map[string]bool{}
 
 	for _, pkg := range pkgs {
 		for _, pkgErr := range pkg.Errors {
 			fmt.Fprintf(os.Stderr, "gochunker: package error: %v\n", pkgErr)
 		}
 
-		packageInfos = append(packageInfos, packageInfoFromPackage(repoRoot, pkg))
+		// The import graph describes plain packages only, not test variants.
+		if !isTestVariant(pkg) {
+			packageInfos = append(packageInfos, packageInfoFromPackage(repoRoot, pkg))
+		}
 
 		for i, file := range pkg.Syntax {
 			if i >= len(pkg.CompiledGoFiles) {
@@ -151,12 +262,14 @@ func loadModule(repoRoot, moduleRoot string) ([]FileInfo, []PackageInfo, error) 
 			}
 
 			absPath := pkg.CompiledGoFiles[i]
-			src, err := os.ReadFile(absPath)
-			if err != nil {
+			rel, err := filepath.Rel(repoRoot, absPath)
+			// The generated test main lives in the build cache, outside the repository.
+			if err != nil || strings.HasPrefix(rel, "..") || seenFiles[rel] {
 				continue
 			}
+			seenFiles[rel] = true
 
-			rel, err := filepath.Rel(repoRoot, absPath)
+			src, err := os.ReadFile(absPath)
 			if err != nil {
 				continue
 			}
@@ -165,6 +278,7 @@ func loadModule(repoRoot, moduleRoot string) ([]FileInfo, []PackageInfo, error) 
 				Path:        filepath.ToSlash(rel),
 				Language:    "go",
 				PackageName: pkg.Name,
+				IsTest:      strings.HasSuffix(absPath, "_test.go"),
 			}
 
 			for _, decl := range file.Decls {
@@ -178,6 +292,12 @@ func loadModule(repoRoot, moduleRoot string) ([]FileInfo, []PackageInfo, error) 
 	}
 
 	return files, packageInfos, nil
+}
+
+// isTestVariant reports the packages go/packages adds when Tests is set:
+// "p [p.test]", the external "p_test", and the generated "p.test" main.
+func isTestVariant(pkg *packages.Package) bool {
+	return strings.Contains(pkg.ID, " [") || strings.HasSuffix(pkg.PkgPath, ".test") || strings.HasSuffix(pkg.PkgPath, "_test")
 }
 
 func packageInfoFromPackage(repoRoot string, pkg *packages.Package) PackageInfo {

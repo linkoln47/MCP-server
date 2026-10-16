@@ -215,7 +215,7 @@ func findModules(root string) []string {
 
 func ignoredDir(name string) bool {
 	switch name {
-	case ".git", ".venv", "venv", "node_modules", "vendor", "dist", "build", "__pycache__":
+	case ".git", ".venv", "venv", "node_modules", "vendor", "dist", "build", "__pycache__", ".dev":
 		return true
 	default:
 		return false

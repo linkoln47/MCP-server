@@ -11,9 +11,9 @@ from code_index import (
 )
 
 from pathlib import Path
-from mcp.server.fastmcp import FastMCP
+from mcp.server.mcpserver import MCPServer
 
-mcp = FastMCP("repo-search", "A tool to search and map repository files.")
+mcp = MCPServer("repo-search", instructions="A tool to search and map repository files.")
 
 DEFAULT_PROJECT_ROOT = Path(__file__).resolve().parents[1]
 PROJECT_ROOT = Path(os.environ.get("REPO_SEARCH_ROOT", DEFAULT_PROJECT_ROOT)).expanduser().resolve()
@@ -27,6 +27,8 @@ IGNORE_DIRS = {
     "build",
     "coverage",
     "__pycache__",
+    # Anikoro's dev.sh runtime state: built binaries, logs, pidfiles.
+    ".dev",
 }
 
 

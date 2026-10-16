@@ -9,6 +9,16 @@ from code_index import (
     package_dependency_graph as build_package_dependency_graph,
     search_index as index_search,
 )
+from fsd import (
+    FRONT_SRC_REL,
+    explain_frontend_dir,
+    format_slice_graph_json,
+    format_slice_graph_mermaid,
+    format_slice_graph_text,
+    front_src,
+    slice_dependency_graph as build_slice_dependency_graph,
+)
+from js_outline import format_js_outline, is_js_file, outline_js_file
 
 from pathlib import Path
 from mcp.server.mcpserver import MCPServer
@@ -502,18 +512,28 @@ def find_entrypoints(limit: int = 50) -> str:
 @mcp.tool()
 def get_file_outline(path: str) -> str:
     """
-    Return a compact outline for a single Go source file.
+    Return a compact outline for a single Go or JavaScript/TypeScript file.
+
+    Go: package, imports, types, functions, methods, constants, variables.
+    JS/TS: imports, exports, and components, hooks, functions, classes, types,
+    interfaces, enums and values, each with its line number.
 
     path must be relative to PROJECT_ROOT, for example:
-    back/internal/domain/auth.go
+    back/internal/domain/auth.go or front/src/app/usePathRoute.ts
     """
     try:
         file_path = safe_file_path(path)
     except ValueError as err:
         return f"Error: {err}"
 
+    if is_js_file(file_path):
+        try:
+            return format_js_outline(file_path.relative_to(PROJECT_ROOT).as_posix(), outline_js_file(file_path))
+        except Exception as err:
+            return f"Error: {err}"
+
     if file_path.suffix != ".go":
-        return f"Unsupported file type: {path}. get_file_outline currently supports Go files only."
+        return f"Unsupported file type: {path}. get_file_outline supports Go and JS/TS files."
 
     try:
         outline = outline_go_files(PROJECT_ROOT, [file_path])[0]
@@ -558,24 +578,23 @@ def get_file_outline(path: str) -> str:
 @mcp.tool()
 def explain_package(package_path: str, include_tests: bool = False) -> str:
     """
-    Explain a Go package directory.
+    Explain a Go package directory or a frontend (FSD) directory.
 
-    Provide a compact overview of:
-    - package name
-    - Go files
-    - imports
-    - types
-    - functions
-    - methods
-    - constants
-    - variables
+    Go package: package name, files, imports, types, functions, methods,
+    constants, variables.
 
-    _test.go files are left out of the overview unless include_tests is true;
-    the output then names the hidden files. A directory holding only tests
-    shows them regardless.
+    Directory under front/src (a slice such as front/src/features/listEdit, a
+    segment, or a whole layer): FSD layer and slice, public API from index.*,
+    per-file components/hooks/functions/types, the slices it depends on, the
+    packages it uses, and the slices that import it. Imports that bypass a
+    slice's index.*, go up a layer, or cross into a sibling slice are marked.
+
+    Test files (_test.go, *.test.*/*.spec.*) are left out unless include_tests
+    is true; the output then names the hidden files. A directory holding only
+    tests shows them regardless.
 
     package_path must be a path relative to PROJECT_ROOT, for example:
-    back/internal/domain
+    back/internal/domain or front/src/features/listEdit
     """
     try:
         package_dir = safe_package_dir(package_path)
@@ -587,6 +606,12 @@ def explain_package(package_path: str, include_tests: bool = False) -> str:
         for path in package_dir.glob("*.go")
         if path.is_file() and not path.name.endswith("_generated.go")
     )
+
+    if not go_files and package_dir.is_relative_to(front_src(PROJECT_ROOT)):
+        try:
+            return explain_frontend_dir(PROJECT_ROOT, package_dir, include_tests, is_ignored)
+        except Exception as err:
+            return f"Error: {err}"
 
     if not go_files:
         suggestions = find_go_package_dirs(package_dir)
@@ -770,6 +795,47 @@ def package_dependency_graph(
         return json.dumps(graph, indent=2, ensure_ascii=False)
     if output == "mermaid":
         return format_package_dependency_graph_mermaid(graph)
+
+    return "Error: unsupported output. Use one of: text, json, mermaid."
+
+@mcp.tool()
+def slice_dependency_graph(
+    root_path: str = FRONT_SRC_REL,
+    output: str = "text",
+    include_tests: bool = False,
+    include_external: bool = False,
+) -> str:
+    """
+    Return the dependency graph between frontend FSD units (slices such as
+    features/listEdit, segments such as shared/api, the app layer).
+
+    Edges count imports between units. Rule-breaking imports are listed:
+    upward (into a higher layer), cross-slice (into a sibling slice of the same
+    layer), and deep (bypassing a slice's index.* public API).
+
+    root_path narrows the importing side to a directory under front/src, for
+    example front/src/pages. output supports text, json and mermaid.
+    """
+    try:
+        root = safe_package_dir(root_path)
+    except ValueError as err:
+        return f"Error: {err}"
+
+    if not root.is_relative_to(front_src(PROJECT_ROOT)):
+        return f"Error: root_path must be inside {FRONT_SRC_REL}"
+
+    try:
+        graph = build_slice_dependency_graph(PROJECT_ROOT, root, include_tests, include_external, is_ignored)
+    except Exception as err:
+        return f"Error: {err}"
+
+    output = output.strip().lower() or "text"
+    if output == "text":
+        return format_slice_graph_text(graph)
+    if output == "json":
+        return format_slice_graph_json(graph)
+    if output == "mermaid":
+        return format_slice_graph_mermaid(graph)
 
     return "Error: unsupported output. Use one of: text, json, mermaid."
 

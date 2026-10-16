@@ -556,7 +556,7 @@ def get_file_outline(path: str) -> str:
     return "\n".join(lines).strip()
 
 @mcp.tool()
-def explain_package(package_path: str) -> str:
+def explain_package(package_path: str, include_tests: bool = False) -> str:
     """
     Explain a Go package directory.
 
@@ -569,6 +569,10 @@ def explain_package(package_path: str) -> str:
     - methods
     - constants
     - variables
+
+    _test.go files are left out of the overview unless include_tests is true;
+    the output then names the hidden files. A directory holding only tests
+    shows them regardless.
 
     package_path must be a path relative to PROJECT_ROOT, for example:
     back/internal/domain
@@ -602,6 +606,15 @@ def explain_package(package_path: str) -> str:
             return "\n".join(lines)
 
         return f"No Go files found in package path: {package_path}"
+
+    test_files = [path for path in go_files if path.name.endswith("_test.go")]
+    hidden_tests: list[Path] = []
+    only_tests = len(test_files) == len(go_files)
+
+    # Hiding the tests of a test-only directory would leave nothing to explain.
+    if not include_tests and not only_tests:
+        hidden_tests = test_files
+        go_files = [path for path in go_files if path not in test_files]
 
     try:
         outlines = outline_go_files(PROJECT_ROOT, go_files)
@@ -650,7 +663,8 @@ def explain_package(package_path: str) -> str:
         if not parts:
             parts.append("no top-level symbols detected")
 
-        file_summaries.append(f"- {path.name}: " + "; ".join(parts))
+        test_mark = " (test)" if path.name.endswith("_test.go") else ""
+        file_summaries.append(f"- {path.name}{test_mark}: " + "; ".join(parts))
 
     rel_dir = package_dir.relative_to(PROJECT_ROOT)
 
@@ -667,9 +681,21 @@ def explain_package(package_path: str) -> str:
     lines.append(f"Package name: {package_name_text}")
     lines.append("")
 
+    if only_tests and not include_tests:
+        lines.append("Note: this directory holds only _test.go files, so they are shown.")
+        lines.append("")
+
     lines.append("Files:")
     lines.extend(file_summaries)
     lines.append("")
+
+    if hidden_tests:
+        lines.append(
+            f"Test files hidden ({len(hidden_tests)}): "
+            + ", ".join(path.name for path in hidden_tests)
+        )
+        lines.append(f"Call explain_package(\"{rel_dir}\", include_tests=true) to include them.")
+        lines.append("")
 
     if all_imports:
         lines.append("Imports:")
